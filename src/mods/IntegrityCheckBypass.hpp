@@ -48,6 +48,10 @@ public:
     static std::shared_ptr<IntegrityCheckBypass>& get_shared_instance();
 
 private:
+    static void install_re9_submit_descriptor_fallbacks(uintptr_t game_begin, uintptr_t game_end);
+    static void install_re9_ud2_recovery_veh(uintptr_t game_begin, uintptr_t game_end);
+    static LONG WINAPI re9_ud2_recovery_veh(_EXCEPTION_POINTERS* ei);
+
     static void* renderer_create_blas_hook(void* a1, void* a2, void* a3, void* a4, void* a5);
     static inline std::unique_ptr<FunctionHook> s_renderer_create_blas_hook{};
     static inline uint32_t* s_corruption_when_zero{ nullptr };

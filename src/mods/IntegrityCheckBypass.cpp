@@ -1,4 +1,7 @@
+#include <atomic>
 #include <unordered_set>
+#include <unordered_map>
+#include <mutex>
 #include <iomanip>
 #include <regex>
 
@@ -1463,6 +1466,11 @@ void IntegrityCheckBypass::immediate_patch_dd2() {
 
 // Temporary workarounds
 static SafetyHookInline g_submit_hook{};
+static uintptr_t g_re9_ud2_recovery_module_begin{};
+static uintptr_t g_re9_ud2_recovery_module_end{};
+static PVOID g_re9_ud2_recovery_veh_handle{};
+static bool g_re9_ud2_recovery_veh_installed{};
+static std::atomic<uint32_t> g_re9_ud2_recovery_count{};
 
 static void log_submit_descriptor_once(int64_t descriptor, uintptr_t first_entry, uintptr_t func_ptr) {
     static std::unordered_set<int64_t> seen_descriptors{};
@@ -1546,6 +1554,9 @@ uintptr_t __fastcall hk_JobQueue_SubmitDescriptor(uintptr_t scheduler, int64_t d
                 if (original_func_ptr != 0 && original_func_ptr != func_ptr) {
                     *reinterpret_cast<uintptr_t*>(first_entry + 8) = original_func_ptr;
                     SPDLOG_INFO("[IntegrityCheckBypass]: Restored descriptor 0x{:X} func pointer to 0x{:X} (was 0x{:X})", descriptor, original_func_ptr, func_ptr);
+                } else {
+                    *reinterpret_cast<uintptr_t*>(first_entry + 8) = reinterpret_cast<uintptr_t>(&noop_job);
+                    SPDLOG_INFO("[IntegrityCheckBypass]: Replaced UD2 func pointer 0x{:X} with noop_job for descriptor 0x{:X}", func_ptr, descriptor);
                 }
 
                 auto func_ptr_addr = first_entry + 8;
@@ -1553,9 +1564,7 @@ uintptr_t __fastcall hk_JobQueue_SubmitDescriptor(uintptr_t scheduler, int64_t d
 
                 const auto retaddr = (uintptr_t)_ReturnAddress();
                 SPDLOG_INFO("[IntegrityCheckBypass]: Caught integrity check job submission! Descriptor: 0x{:X}, Func Ptr: 0x{:X}, Return Address: 0x{:X}", descriptor, func_ptr, retaddr);
-            }
-
-            if (func_ptr) {
+            } else if (func_ptr) {
                 remember_submit_descriptor_original_func_ptr(first_entry, func_ptr);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1599,12 +1608,161 @@ void validate_job_func(SafetyHookContext& ctx) {
     }
 }
 
+void IntegrityCheckBypass::install_re9_submit_descriptor_fallbacks(uintptr_t game_begin, uintptr_t game_end) {
+    const auto game = reinterpret_cast<HMODULE>(game_begin);
+    if (game == nullptr || game_end <= game_begin) {
+        spdlog::error("[IntegrityCheckBypass]: Cannot install RE9 submit descriptor fallbacks due to invalid game module bounds");
+        return;
+    }
+
+    static bool s_submit_inline_hook_attempted{};
+    static bool s_submit_inline_hook_installed{};
+    static bool s_hook_summary_logged{};
+    static std::vector<SafetyHookMid> s_submit_callsites{};
+    static std::unordered_set<uintptr_t> s_installed_callsite_refs{};
+
+    size_t duplicate_candidates = 0;
+
+    if (!s_submit_inline_hook_attempted) {
+        s_submit_inline_hook_attempted = true;
+
+        auto ref = utility::scan(game, "41 B9 FF FF FF FF E8 ? ? ? ? 48 89 BE");
+        auto fn = ref ? utility::calculate_absolute(*ref + 7) : std::optional<uintptr_t>{};
+
+        if (fn) {
+            try {
+                g_submit_hook = safetyhook::create_inline(*fn, hk_JobQueue_SubmitDescriptor);
+                s_submit_inline_hook_installed = true;
+                spdlog::info("[IntegrityCheckBypass]: Hooked JobQueue::SubmitDescriptor in RE9 @ 0x{:X}", *fn);
+            } catch (...) {
+                spdlog::error("[IntegrityCheckBypass]: Failed to install JobQueue::SubmitDescriptor fallback hook in RE9");
+            }
+        } else {
+            spdlog::warn("[IntegrityCheckBypass]: Could not locate JobQueue::SubmitDescriptor fallback hook target in RE9");
+        }
+    }
+
+    std::unordered_set<uintptr_t> seen_scan_callsite_refs{};
+    constexpr auto callsite_sig = "48 8b 42 08 48 8b 4a 10 48 8b 52 18 48 85 c9 0f 84 ? ? ? ? ff d0";
+
+    for (auto ref = utility::scan(game, callsite_sig);
+        ref;
+        ref = utility::scan((*ref + 1), game_end - (*ref + 1), callsite_sig))
+    {
+        if (!seen_scan_callsite_refs.emplace(*ref).second || !s_installed_callsite_refs.emplace(*ref).second) {
+            ++duplicate_candidates;
+            continue;
+        }
+
+        try {
+            s_submit_callsites.emplace_back(safetyhook::create_mid((void*)(*ref + 4), validate_job_func));
+        } catch (...) {
+            s_installed_callsite_refs.erase(*ref);
+            spdlog::error("[IntegrityCheckBypass]: Failed to hook RE9 submit descriptor validation call site @ 0x{:X}", *ref);
+        }
+    }
+
+    if (!s_hook_summary_logged) {
+        spdlog::info(
+            "[IntegrityCheckBypass]: RE9 fallback hooks initialized. SubmitDescriptor inline hook installed: {}, callsite hooks: {}, duplicate candidates skipped: {}",
+            s_submit_inline_hook_installed,
+            s_submit_callsites.size(),
+            duplicate_candidates
+        );
+        s_hook_summary_logged = true;
+    }
+}
+
+LONG WINAPI IntegrityCheckBypass::re9_ud2_recovery_veh(_EXCEPTION_POINTERS* ei) {
+    if (ei == nullptr || ei->ExceptionRecord == nullptr || ei->ContextRecord == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    if (ei->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    const auto rip = (uintptr_t)ei->ContextRecord->Rip;
+    const auto rax = (uintptr_t)ei->ContextRecord->Rax;
+
+    if (rip == 0 || rip != rax) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    if (g_re9_ud2_recovery_module_begin == 0 || g_re9_ud2_recovery_module_end <= g_re9_ud2_recovery_module_begin) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    if (rip < g_re9_ud2_recovery_module_begin || rip >= g_re9_ud2_recovery_module_end) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    bool is_ud2 = false;
+    __try {
+        is_ud2 = (*reinterpret_cast<const uint16_t*>(rip) == 0x0B0F);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    if (!is_ud2) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    const auto noop_job_ptr = reinterpret_cast<uintptr_t>(&noop_job);
+    ei->ContextRecord->Rip = noop_job_ptr;
+    ei->ContextRecord->Rax = noop_job_ptr;
+
+    const auto recoveries = ++g_re9_ud2_recovery_count;
+    if (recoveries <= 5 || (recoveries % 100) == 0) {
+        SPDLOG_WARN(
+            "[IntegrityCheckBypass]: Recovered RE9 UD2 gadget crash #{} at 0x{:X}; redirected execution to noop_job",
+            recoveries,
+            rip
+        );
+    }
+
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void IntegrityCheckBypass::install_re9_ud2_recovery_veh(uintptr_t game_begin, uintptr_t game_end) {
+    if (game_begin == 0 || game_end <= game_begin) {
+        spdlog::error("[IntegrityCheckBypass]: Cannot install RE9 UD2 recovery VEH due to invalid game module bounds");
+        return;
+    }
+
+    g_re9_ud2_recovery_module_begin = game_begin;
+    g_re9_ud2_recovery_module_end = game_end;
+
+    if (g_re9_ud2_recovery_veh_installed) {
+        return;
+    }
+
+    g_re9_ud2_recovery_veh_handle = AddVectoredExceptionHandler(1, re9_ud2_recovery_veh);
+    if (g_re9_ud2_recovery_veh_handle == nullptr) {
+        spdlog::error("[IntegrityCheckBypass]: Could not install RE9 UD2 recovery VEH");
+        return;
+    }
+
+    g_re9_ud2_recovery_veh_installed = true;
+    spdlog::info("[IntegrityCheckBypass]: Installed RE9 UD2 recovery VEH");
+}
+
 void IntegrityCheckBypass::immediate_patch_re9() {
     spdlog::info("[IntegrityCheckBypass]: Scanning RE9...");
 
     const auto game = utility::get_executable();
     const auto game_size = utility::get_module_size(game).value_or(0);
     const auto game_end = (uintptr_t)game + game_size;
+
+#if defined(RE9)
+    constexpr bool force_re9_fallback_hooks = true;
+#else
+    constexpr bool force_re9_fallback_hooks = false;
+#endif
+
+    if (force_re9_fallback_hooks) {
+        install_re9_ud2_recovery_veh((uintptr_t)game, game_end);
+    }
 
     static std::vector<Patch::Ptr> sus_constant_patches2{};
 
@@ -1655,8 +1813,7 @@ void IntegrityCheckBypass::immediate_patch_re9() {
 
         spdlog::info("Checking candidate at 0x{:X}, pop_count: {}", *ref, pop_count);
 
-        // Now check if we have a cmov conditional nearby.
-        bool prev_was_ret = false;
+        // Now check if we have a CMOV that targets RCX nearby.
         utility::linear_decode((uint8_t*)*ref, 0x150, [&](utility::ExhaustionContext& ctx) -> bool {
 #if 0
             char buf[256]{};
@@ -1665,6 +1822,14 @@ void IntegrityCheckBypass::immediate_patch_re9() {
 #endif
 
             if (ctx.instrux.Instruction == ND_INS_CMOVcc) {
+                const bool cmov_targets_rcx = ctx.instrux.OperandsCount > 0
+                    && ctx.instrux.Operands[0].Type == ND_OP_REG
+                    && ctx.instrux.Operands[0].Info.Register.Reg == NDR_RCX;
+
+                if (!cmov_targets_rcx) {
+                    return true;
+                }
+
                 result = ctx.addr;
                 nop_size = ctx.instrux.Length;
                 return false;
@@ -1694,34 +1859,11 @@ void IntegrityCheckBypass::immediate_patch_re9() {
         spdlog::info("[IntegrityCheckBypass]: Patched thread scheduler corruptor in RE9!");
     } else {
         spdlog::error("[IntegrityCheckBypass]: Could not find conditional move instruction for thread scheduler corruptor in RE9!");
+        spdlog::warn("[IntegrityCheckBypass]: CMOV patch path unavailable in RE9; relying on submit descriptor fallback hooks.");
+    }
 
-        spdlog::error("[IntegrityCheckBypass]: Could not find thread scheduler corruptor in RE9!");
-        spdlog::warn("[IntegrityCheckBypass]: Attempting to hook JobQueue::SubmitDescriptor as a fallback for RE9. This may cause lag during integrity check jobs, but it should prevent crashes.");
-
-        // Temporary workarounds for when none of that can be found
-        // Temporarily needed on EGS and Japanese copies where obfuscation is different.
-        // game will still lag but function with these.
-        auto ref = utility::scan(game, "41 B9 FF FF FF FF E8 ? ? ? ? 48 89 BE");
-        auto fn = ref ? utility::calculate_absolute(*ref + 7) : std::optional<uintptr_t>{};
-
-        if (fn) {
-            g_submit_hook = safetyhook::create_inline(
-                *fn,
-                hk_JobQueue_SubmitDescriptor
-            );
-
-            spdlog::info("[IntegrityCheckBypass]: Hooked JobQueue::SubmitDescriptor in RE9 @ 0x{:X}!", *fn);
-        }
-
-        static std::vector<SafetyHookMid> callsites{};
-
-        for (auto ref = utility::scan(utility::get_executable(), "48 8b 42 08 48 8b 4a 10 48 8b 52 18 48 85 c9 0f 84 ? ? ? ? ff d0"); 
-            ref; 
-            ref = utility::scan((*ref + 1), game_end - (*ref + 1), "48 8b 42 08 48 8b 4a 10 48 8b 52 18 48 85 c9 0f 84 ? ? ? ? ff d0")) 
-        {
-            callsites.emplace_back(safetyhook::create_mid((void*)(*ref + 4), validate_job_func));
-            spdlog::info("[IntegrityCheckBypass]: Hooked call site at 0x{:X}", *ref);
-        }
+    if (force_re9_fallback_hooks || !result) {
+        install_re9_submit_descriptor_fallbacks((uintptr_t)game, game_end);
     }
 
     // Scan for PE header integrity check (thanks to SunBeam for pointing out this exists in RE9 and showing me where it is!)
